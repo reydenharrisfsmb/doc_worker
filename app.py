@@ -69,62 +69,52 @@ def _process_with_docai(gcs_uri: str) -> dict:
 
 @app.post("/work")
 def work():
-    # Pub/Sub push format: {"message": {"data": "<base64>"}}
     envelope = request.get_json(silent=True)
     if not envelope or "message" not in envelope:
-        abort(400, "Bad Pub/Sub push: no message")
+        abort(400, "Bad Pub/Sub push")
 
     msg = envelope["message"]
-    data_b64 = msg.get("data", "")
-    try:
-        decoded = base64.b64decode(data_b64).decode("utf-8")
-        payload = json.loads(decoded or "{}")
-    except Exception as e:
-        app.logger.error(f"Failed to decode Pub/Sub message: {e}")
-        abort(400, "Bad Pub/Sub data")
+    data = json.loads(base64.b64decode(msg.get("data", "")).decode("utf-8") or "{}")
 
-    doc_id = payload.get("docId")
-    gcs_uri = payload.get("gcsUri")
-    routing_type = payload.get("type", "job.queued")
-
+    doc_id = data.get("docId")
+    gcs_uri = data.get("gcsUri")
     if not doc_id or not gcs_uri:
-        app.logger.error("Missing docId or gcsUri in message")
         abort(400, "Missing docId or gcsUri")
 
-    # mark job RUNNING
+    # mark job running
     _update_job(doc_id, {"status": "RUNNING", "phase": "PROCESS"})
 
-    # pick engine (you can expand later)
-    # if routing_type == "job.queued" and DOCAI_PROCESSOR_ID:
-    #     result = _process_with_docai(gcs_uri)
-    # else:
-    result = _fake_process(gcs_uri)
+    try:
+        # 1) process
+        result = _fake_process(gcs_uri)
 
-    # write output JSON to GCS
-    out_key = f"{PROCESSED_PREFIX}{doc_id}.json"
-    out_blob = storage_client.bucket(OUTPUT_BUCKET).blob(out_key)
-    out_blob.upload_from_string(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        content_type="application/json",
-    )
+        # 2) write output
+        out_key = f"{PROCESSED_PREFIX}{doc_id}.json"
+        bucket = storage_client.bucket(OUTPUT_BUCKET)
+        blob = bucket.blob(out_key)
+        blob.upload_from_string(
+            json.dumps(result, indent=2),
+            content_type="application/json",
+        )
 
-    # mark job SUCCEEDED
-    _update_job(
-        doc_id,
-        {
+        # 3) mark success
+        _update_job(doc_id, {
             "status": "SUCCEEDED",
             "phase": "INDEX",
-            "outputs": {
-                "jsonUri": f"gs://{OUTPUT_BUCKET}/{out_key}"
-            },
-        },
-    )
+            "outputs": {"jsonUri": f"gs://{OUTPUT_BUCKET}/{out_key}"}
+        })
+        app.logger.info(f"Processed {doc_id} from {gcs_uri} -> gs://{OUTPUT_BUCKET}/{out_key}")
+        return ("OK", 200)
 
-    app.logger.info(
-        f"Processed job docId={doc_id} from {gcs_uri} -> gs://{OUTPUT_BUCKET}/{out_key}"
-    )
-
-    return ("OK", 200)
+    except Exception as e:
+        app.logger.error(f"Processing failed for {doc_id}: {e}")
+        _update_job(doc_id, {
+            "status": "FAILED",
+            "phase": "PROCESS",
+            "errors": [str(e)]
+        })
+        # return 200 so Pub/Sub doesn't retry forever, or 500 if you *want* retries
+        return ("FAILED", 200)
 
 
 @app.get("/")
