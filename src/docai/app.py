@@ -42,6 +42,17 @@ next_topic_path = publisher.topic_path(PROJECT_ID, NEXT_TOPIC)
 
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# STARTUP LOG
+# ---------------------------------------------------------------------
+app.logger.info(
+    f"OCR worker boot: "
+    f"PROJECT_ID={PROJECT_ID}, "
+    f"NEXT_TOPIC={NEXT_TOPIC}, "
+    f"OUTPUT_BUCKET={OUTPUT_BUCKET}, "
+    f"DOCAI_LOCATION={DOCAI_LOCATION}, "
+    f"DOCAI_PROCESSOR_ID={'set' if DOCAI_PROCESSOR_ID else 'unset'}"
+)
 def _now_iso() -> str:
     return dt.datetime.utcnow().isoformat() + "Z"
 
@@ -103,10 +114,12 @@ def _run_docai_ocr(gcs_uri: str) -> str:
         return doc.text or ""
 
     if num_pages <= 30:
-        # Native "imageless" parsing (faster, higher page cap)
-        doc = _process_online(raw_doc, _opts_native())
-        # If PDF is scanned (no embedded text), native may return little text.
-        if not (doc.text or "").strip():
+        try:
+            doc = _process_online(raw_doc, _opts_native())
+        except Exception as ex:
+            app.logger.warning(f"Native parsing failed, falling back to chunks: {ex}")
+            doc = None
+        if not doc or not (doc.text or "").strip():
             app.logger.info("Native parsing returned empty text; falling back to chunks.")
             # Fall back to chunked image-based, two chunks max here (<=30)
             combined = []
