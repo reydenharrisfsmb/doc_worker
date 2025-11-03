@@ -3,9 +3,11 @@ import os
 import json
 import base64
 import datetime as dt
+import io
 
 from flask import Flask, request, abort
 from google.cloud import firestore, storage, documentai, pubsub_v1
+from pypdf import PdfReader
 
 app = Flask(__name__)
 
@@ -50,19 +52,85 @@ def _update_job(doc_id: str, payload: dict):
 
 
 def _run_docai_ocr(gcs_uri: str) -> str:
+    """
+    Picks the best OCR strategy based on page count:
+      - <=15 pages: image-based online OCR (default)
+      - 16-30 pages: native PDF parsing ("imageless")
+      - >30 pages: image-based online OCR in 15-page chunks
+    """
     if not DOCAI_PROCESSOR_ID:
-        # fallback / dry run
         return f"[DocAI not configured] Source: {gcs_uri}"
 
-    name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
-
+    # 1) Download the PDF
     bucket_name, object_name = gcs_uri.replace("gs://", "").split("/", 1)
     pdf_bytes = storage_client.bucket(bucket_name).blob(object_name).download_as_bytes()
 
-    raw_document = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
-    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
-    result = docai_client.process_document(request=request).document
-    return result.text or ""
+    # 2) Count pages locally
+    num_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    app.logger.info(f"DocAI: {gcs_uri} has {num_pages} pages")
+
+    name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
+
+    def _process_online(raw_document, process_options=None):
+        req = documentai.ProcessRequest(
+            name=name,
+            raw_document=raw_document,
+            process_options=process_options
+        )
+        return docai_client.process_document(request=req).document
+
+    raw_doc = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
+
+    # Helper: build ProcessOptions
+    def _opts_native():
+        # "Imageless" / native text extraction (raises limit to 30 pages)
+        return documentai.ProcessOptions(
+            ocr_config=documentai.OcrConfig(enable_native_pdf_parsing=True)
+        )
+
+    def _opts_pages(page_numbers):
+        # Image-based but only for a subset of pages
+        return documentai.ProcessOptions(
+            individual_page_selector=documentai.ProcessOptions.IndividualPageSelector(
+                pages=page_numbers
+            )
+        )
+
+    # 3) Strategy selection
+    if num_pages <= 15:
+        # Image-based, all pages at once
+        doc = _process_online(raw_doc)
+        return doc.text or ""
+
+    if num_pages <= 30:
+        # Native "imageless" parsing (faster, higher page cap)
+        doc = _process_online(raw_doc, _opts_native())
+        # If PDF is scanned (no embedded text), native may return little text.
+        if not (doc.text or "").strip():
+            app.logger.info("Native parsing returned empty text; falling back to chunks.")
+            # Fall back to chunked image-based, two chunks max here (<=30)
+            combined = []
+            start = 1
+            while start <= num_pages:
+                end = min(start + 15 - 1, num_pages)
+                pages = list(range(start, end + 1))
+                d = _process_online(raw_doc, _opts_pages(pages))
+                combined.append(d.text or "")
+                start = end + 1
+            return "\n".join(combined)
+        return doc.text or ""
+
+    # > 30 pages: chunk in batches of 15, image-based
+    combined = []
+    start = 1
+    while start <= num_pages:
+        end = min(start + 15 - 1, num_pages)
+        pages = list(range(start, end + 1))
+        app.logger.info(f"OCR chunk {start}-{end}")
+        d = _process_online(raw_doc, _opts_pages(pages))
+        combined.append(d.text or "")
+        start = end + 1
+    return "\n".join(combined)
 
 
 def _write_text_to_gcs(text: str, doc_id: str) -> str:
