@@ -114,24 +114,28 @@ def _run_docai_ocr(gcs_uri: str) -> str:
         return doc.text or ""
 
     if num_pages <= 30:
+        # Try native ("imageless") parsing first
         try:
             doc = _process_online(raw_doc, _opts_native())
-        except Exception as ex:
-            app.logger.warning(f"Native parsing failed, falling back to chunks: {ex}")
-            doc = None
-        if not doc or not (doc.text or "").strip():
+            text = (doc.text or "").strip()
+            if text:
+                return text
             app.logger.info("Native parsing returned empty text; falling back to chunks.")
-            # Fall back to chunked image-based, two chunks max here (<=30)
-            combined = []
-            start = 1
-            while start <= num_pages:
-                end = min(start + 15 - 1, num_pages)
-                pages = list(range(start, end + 1))
-                d = _process_online(raw_doc, _opts_pages(pages))
-                combined.append(d.text or "")
-                start = end + 1
-            return "\n".join(combined)
-        return doc.text or ""
+        except Exception as ex:
+            # Some processors ignore imageless and still enforce 15-page limit → 400 PAGE_LIMIT_EXCEEDED
+            app.logger.warning(f"Native parsing failed, falling back to chunks: {ex}")
+
+        # Fall back to two image-based chunks (<=30 pages total)
+        combined = []
+        start = 1
+        while start <= num_pages:
+            end = min(start + 15 - 1, num_pages)
+            pages = list(range(start, end + 1))  # 1-based inclusive
+            app.logger.info(f"OCR fallback chunk {start}-{end}")
+            d = _process_online(raw_doc, _opts_pages(pages))
+            combined.append(d.text or "")
+            start = end + 1
+        return "\n".join(combined)
 
     # > 30 pages: chunk in batches of 15, image-based
     combined = []
