@@ -136,12 +136,14 @@ def _run_docai_ocr(gcs_uri: str) -> str:
 def _write_text_to_gcs(text: str, doc_id: str) -> str:
     out_name = f"{TXT_PREFIX}{doc_id}.txt"
     blob = storage_client.bucket(OUTPUT_BUCKET).blob(out_name)
-    blob.upload_from_string(text, content_type="text/plain")
+    blob.upload_from_string(text, content_type="text/plain; charset=utf-8")
     return f"gs://{OUTPUT_BUCKET}/{out_name}"
 
 
 def _publish_next(payload: dict):
-    publisher.publish(next_topic_path, json.dumps(payload).encode("utf-8"))
+    data = json.dumps(payload).encode("utf-8")
+    msg_id = publisher.publish(next_topic_path, data).result(timeout=10)
+    app.logger.info(f"Published to {NEXT_TOPIC} msg_id={msg_id} for docId={payload.get('docId')}")
 
 
 # ---------------------------------------------------------------------
