@@ -131,12 +131,11 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
         name=processor_name,
         input_configs=[input_config],
         document_output_config=document_output_config,
-        # FIX: Removed the 'enable_multiple_page_auto_sharding' option.
-        # We are only keeping the critical 'from_gcs_object_storage=True' 
-        # (Imageless Mode) flag to isolate the fix for the page limit error.
+        # FIX: Using the non-deprecated field for Imageless Mode. 
+        # This is equivalent to setting imageless_mode=true and should solve the page limit error.
         process_options=documentai.ProcessOptions(
             ocr_options=documentai.ProcessOptions.OcrOptions(
-                from_gcs_object_storage=True, # Explicitly enable Imageless Mode (increases limit to 30 pages)
+                disable_native_pdf_parsing=True, # The correct modern field to enable imageless mode
             )
         )
     )
