@@ -131,11 +131,11 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
         name=processor_name,
         input_configs=[input_config],
         document_output_config=document_output_config,
-        # FIX: Using the non-deprecated field for Imageless Mode. 
-        # This is equivalent to setting imageless_mode=true and should solve the page limit error.
+        # FIX: Trying the alternate SDK field name for 'imageless mode'
+        # Switching from 'imageless_mode=True' to 'disable_native_pdf_parsing=True'
         process_options=documentai.ProcessOptions(
             ocr_options=documentai.ProcessOptions.OcrOptions(
-                imageless_mode=True, # The correct modern field to enable imageless mode
+                disable_native_pdf_parsing=True, 
             )
         )
     )
