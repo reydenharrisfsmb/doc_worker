@@ -151,9 +151,11 @@ def _read_docai_output(doc_id: str) -> str:
     """
     Reads the DocAI output JSON file(s) from the dedicated output folder
     and extracts the full text. This is called by the /docai_result endpoint.
+    This logic is required to get the text, even if the JSON files themselves are ignored.
     """
     # The full prefix is the DOCAI_OUTPUT_PREFIX + doc_id
     docai_folder_prefix = f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
+    app.logger.info(f"Attempting to read DocAI output for {doc_id} from bucket={OUTPUT_BUCKET} prefix={docai_folder_prefix}")
 
     # 1. List blobs to find the dynamically generated LRO folder
     blobs = storage_client.list_blobs(
@@ -164,26 +166,25 @@ def _read_docai_output(doc_id: str) -> str:
     lro_folder_prefixes = [p for p in blobs.prefixes if p.startswith(docai_folder_prefix)]
     
     if not lro_folder_prefixes:
-        app.logger.error(f"DocAI result LRO folder not found for {doc_id}")
+        app.logger.error(f"DocAI result LRO folder not found in {OUTPUT_BUCKET}/{docai_folder_prefix}. Check bucket contents/permissions.")
         raise FileNotFoundError(f"LRO folder not found in {docai_folder_prefix}")
 
-    # 2. List all JSON files inside the detected LRO folder
+    # Use the first LRO folder found
     lro_folder_path = lro_folder_prefixes[0] 
-    
+    app.logger.info(f"Found LRO path: {lro_folder_path}")
+
+    # 2. List all document JSON files inside the detected LRO folder
+    # We specifically look for "output-*-to-*-shard*.json" or "document.json"
     result_blobs = list(storage_client.list_blobs(
-        OUTPUT_BUCKET, prefix=lro_folder_path, match_glob="**/document.json"
+        OUTPUT_BUCKET, prefix=lro_folder_path, match_glob="**/*.json"
     ))
     
-    # Fallback to common shard files if document.json isn't found
     if not result_blobs:
-        result_blobs = list(storage_client.list_blobs(
-            OUTPUT_BUCKET, prefix=lro_folder_path, match_glob="**/*.json"
-        ))
-
-    if not result_blobs:
-        app.logger.error(f"No DocAI JSON output found for {doc_id} at {lro_folder_path}")
-        raise FileNotFoundError(f"No result JSON found for {doc_id}")
+        app.logger.error(f"No DocAI JSON output found for {doc_id} at {lro_folder_path}. Listing returned zero files.")
+        raise FileNotFoundError(f"No result JSON found for {doc_id} under LRO path.")
     
+    app.logger.info(f"Found {len(result_blobs)} JSON result files. Processing the first one: {result_blobs[0].name}")
+
     # Download and parse the first result JSON (assuming a single document in the batch)
     result_blob = result_blobs[0]
     json_data = result_blob.download_as_bytes()
@@ -191,8 +192,13 @@ def _read_docai_output(doc_id: str) -> str:
     # Document AI output is in Protocol Buffer format (JSON-encoded)
     document = documentai.Document.from_json(json_data, ignore_unknown_fields=True)
     
-    # The text is the full document text, which is what you want for OCR
-    return document.text or ""
+    # Extract the text
+    ocr_text = document.text or ""
+    
+    if not ocr_text:
+        app.logger.warning(f"Extracted text was empty for doc_id {doc_id} from file {result_blob.name}. DocAI may have failed to process the document content.")
+        
+    return ocr_text
 
 # --- ENDPOINTS ---
 
@@ -311,7 +317,7 @@ def docai_result():
         if not job_doc.exists:
             app.logger.warning(f"Job document {doc_id} not found. Continuing without full job data. Original source GCS URI cannot be determined.")
             routing_info = {}
-            # The gcsUri is stored in the job document. If the document is missing,
+            # gcsUri is stored in the job document. If the document is missing,
             # we cannot reliably construct the original file location, so we set it to None.
             gcs_uri = None 
         else:
@@ -320,18 +326,18 @@ def docai_result():
             gcs_uri = job_data.get("gcsUri") # Should be available from the job start
 
 
-        # 4. Read DocAI output and extract text
+        # 4. Read DocAI output and extract text (This step is required to get the text)
         ocr_text = _read_docai_output(doc_id)
 
-        # 5. Write raw text to the 'txt/' GCS folder
+        # 5. Write raw text to the 'txt/' GCS folder (Your desired output)
         text_uri = _write_text_to_gcs(ocr_text, doc_id)
 
         # 6. Update job status and artifacts
+        # ONLY storing the textUri in the artifacts, as requested.
         _update_job(doc_id, {
             "status": "SUCCEEDED",
             "phase": "OCR_DONE",
             "artifacts": {"textUri": text_uri},
-            "docaiOutputUri": f"gs://{OUTPUT_BUCKET}/{DOCAI_OUTPUT_PREFIX}{doc_id}/",
         })
         
         # 7. Publish to next worker (Gemini)
@@ -359,6 +365,7 @@ def docai_result():
                 })
             except Exception as update_error:
                 app.logger.error(f"Failed to update job status after result error: {update_error}")
+        # Return 500 to signal a transient error to Pub/Sub for retry
         return (f"ERROR: {e}", 500)
 
 
