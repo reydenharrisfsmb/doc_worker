@@ -131,6 +131,12 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
         name=processor_name,
         input_configs=[input_config],
         document_output_config=document_output_config,
+        # NEW: Enable Imageless Mode for increased page limit (up to 30 pages for standard OCR).
+        process_options=documentai.ProcessOptions(
+            ocr_options=documentai.ProcessOptions.OcrOptions(
+                from_gcs_object_storage=True 
+            )
+        )
     )
 
     # 4. Start the Long Running Operation (LRO) with retry logic
