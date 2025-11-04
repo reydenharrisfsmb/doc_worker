@@ -131,10 +131,12 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
         name=processor_name,
         input_configs=[input_config],
         document_output_config=document_output_config,
-        # NEW: Enable Imageless Mode for increased page limit (up to 30 pages for standard OCR).
+        # FIX: Explicitly set both imageless mode (to increase page limit) and 
+        # auto-sharding (recommended for large PDFs) to ensure the options are applied.
         process_options=documentai.ProcessOptions(
             ocr_options=documentai.ProcessOptions.OcrOptions(
-                from_gcs_object_storage=True 
+                from_gcs_object_storage=True, # Enables Imageless Mode (increases limit to 30 pages)
+                enable_multiple_page_auto_sharding=True # Recommended for large PDFs
             )
         )
     )
