@@ -62,11 +62,6 @@ def _update_job(doc_id: str, payload: dict):
     db.collection(FS_COLLECTION).document(doc_id).set(payload, merge=True)
 
 
-# In your imports at the top of the file, add PdfWriter
-# from pypdf import PdfReader, PdfWriter
-from pypdf import PdfReader, PdfWriter
-
-
 def _run_docai_ocr(gcs_uri: str) -> str:
     """
     Picks the best OCR strategy based on page count.
