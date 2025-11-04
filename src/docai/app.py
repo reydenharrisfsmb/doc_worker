@@ -62,12 +62,14 @@ def _update_job(doc_id: str, payload: dict):
     db.collection(FS_COLLECTION).document(doc_id).set(payload, merge=True)
 
 
+# In your imports at the top of the file, add PdfWriter
+# from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter
+
+
 def _run_docai_ocr(gcs_uri: str) -> str:
     """
-    Picks the best OCR strategy based on page count:
-      - <=15 pages: image-based online OCR (default)
-      - 16-30 pages: native PDF parsing ("imageless")
-      - >30 pages: image-based online OCR in 15-page chunks
+    Picks the best OCR strategy based on page count.
     """
     if not DOCAI_PROCESSOR_ID:
         return f"[DocAI not configured] Source: {gcs_uri}"
@@ -75,78 +77,79 @@ def _run_docai_ocr(gcs_uri: str) -> str:
     # 1) Download the PDF
     bucket_name, object_name = gcs_uri.replace("gs://", "").split("/", 1)
     pdf_bytes = storage_client.bucket(bucket_name).blob(object_name).download_as_bytes()
+    pdf_file = io.BytesIO(pdf_bytes)
 
     # 2) Count pages locally
-    num_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    reader = PdfReader(pdf_file)
+    num_pages = len(reader.pages)
     app.logger.info(f"DocAI: {gcs_uri} has {num_pages} pages")
 
     name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
 
-    def _process_online(raw_document, process_options=None):
+    def _process_online(doc_bytes, process_options=None):
+        """Helper to process a raw document from bytes."""
+        raw_doc = documentai.RawDocument(
+            content=doc_bytes, mime_type="application/pdf"
+        )
         req = documentai.ProcessRequest(
             name=name,
-            raw_document=raw_document,
+            raw_document=raw_doc,
             process_options=process_options
         )
         return docai_client.process_document(request=req).document
 
-    raw_doc = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
-
-    # Helper: build ProcessOptions
+    # Helper: build ProcessOptions for "imageless"
     def _opts_native():
-        # "Imageless" / native text extraction (raises limit to 30 pages)
         return documentai.ProcessOptions(
             ocr_config=documentai.OcrConfig(enable_native_pdf_parsing=True)
         )
 
-    def _opts_pages(page_numbers):
-        # Image-based but only for a subset of pages
-        return documentai.ProcessOptions(
-            individual_page_selector=documentai.ProcessOptions.IndividualPageSelector(
-                pages=page_numbers
-            )
-        )
-
     # 3) Strategy selection
     if num_pages <= 15:
-        # Image-based, all pages at once
-        doc = _process_online(raw_doc)
+        # Strategy 1: Image-based, all pages at once
+        app.logger.info(f"Strategy: Online (1 chunk, {num_pages} pages)")
+        doc = _process_online(pdf_bytes)
         return doc.text or ""
 
     if num_pages <= 30:
-        # Try native ("imageless") parsing first
+        # Strategy 2: Try native ("imageless") parsing first
+        app.logger.info(f"Strategy: Online Imageless (1 chunk, {num_pages} pages)")
         try:
-            doc = _process_online(raw_doc, _opts_native())
+            doc = _process_online(pdf_bytes, _opts_native())
             text = (doc.text or "").strip()
             if text:
                 return text
             app.logger.info("Native parsing returned empty text; falling back to chunks.")
         except Exception as ex:
-            # Some processors ignore imageless and still enforce 15-page limit → 400 PAGE_LIMIT_EXCEEDED
+            # Some processors ignore imageless and still enforce 15-page limit
             app.logger.warning(f"Native parsing failed, falling back to chunks: {ex}")
 
-        # Fall back to two image-based chunks (<=30 pages total)
-        combined = []
-        start = 1
-        while start <= num_pages:
-            end = min(start + 15 - 1, num_pages)
-            pages = list(range(start, end + 1))  # 1-based inclusive
-            app.logger.info(f"OCR fallback chunk {start}-{end}")
-            d = _process_online(raw_doc, _opts_pages(pages))
-            combined.append(d.text or "")
-            start = end + 1
-        return "\n".join(combined)
-
-    # > 30 pages: chunk in batches of 15, image-based
+    # Strategy 3: Chunking (for >30 pages OR imageless fallback)
+    # We must create new, smaller PDFs for each chunk.
+    app.logger.info(f"Strategy: Online Chunking ({num_pages} total pages)")
     combined = []
     start = 1
+    chunk_size = 15  # Max pages for online processing
+
     while start <= num_pages:
-        end = min(start + 15 - 1, num_pages)
-        pages = list(range(start, end + 1))
-        app.logger.info(f"OCR chunk {start}-{end}")
-        d = _process_online(raw_doc, _opts_pages(pages))
+        end = min(start + chunk_size - 1, num_pages)
+        app.logger.info(f"Processing chunk: pages {start}-{end}")
+
+        # Create a new PDF in memory with just this chunk's pages
+        writer = PdfWriter()
+        for page_num in range(start - 1, end):  # pypdf is 0-indexed
+            writer.add_page(reader.pages[page_num])
+
+        # Get the bytes from the in-memory PDF
+        chunk_io = io.BytesIO()
+        writer.write(chunk_io)
+        chunk_bytes = chunk_io.getvalue()
+
+        # Process *only* the chunk bytes
+        d = _process_online(chunk_bytes)
         combined.append(d.text or "")
         start = end + 1
+
     return "\n".join(combined)
 
 
