@@ -7,7 +7,7 @@ import io
 
 from flask import Flask, request, abort
 from google.cloud import firestore, storage, documentai, pubsub_v1
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 app = Flask(__name__)
 
