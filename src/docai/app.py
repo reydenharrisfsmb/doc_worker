@@ -1,49 +1,60 @@
-# src/docai/app.py
 import os
 import json
 import base64
 import datetime as dt
-import io
-
 from flask import Flask, request, abort
-from google.cloud import firestore, storage, documentai, pubsub_v1
-from pypdf import PdfReader, PdfWriter
+from google.cloud import firestore, storage, pubsub_v1
+from google.cloud import documentai_v1 as documentai
+from google.api_core.client_options import ClientOptions
 
-app = Flask(__name__)
+# --- HELPER TO ENFORCE ENV VARS ---
+def _get_env_or_raise(name: str) -> str:
+    """Gets an environment variable or raises a RuntimeError if it's not set."""
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Required environment variable '{name}' is not set.")
+    return value
 
-# ---------------------------------------------------------------------
-# ENV
-# ---------------------------------------------------------------------
+# --- ENVIRONMENT VARIABLES & CONFIGURATION ---
+
+# Project and location variables
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
 if not PROJECT_ID:
+    # Retaining existing check for PROJECT_ID
     raise RuntimeError("PROJECT_ID / GOOGLE_CLOUD_PROJECT must be set")
 
-FS_DATABASE = os.environ.get("FS_DATABASE", "(default)")
-FS_COLLECTION = os.environ.get("FS_COLLECTION", "jobs")
+# Firestore configuration (setting non-critical ones to None lets the library use its default)
+FS_DATABASE = os.environ.get("FS_DATABASE")
+FS_COLLECTION = os.environ.get("FS_COLLECTION")
 
-OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET", "fsmb-legal-docs")
-TXT_PREFIX = os.environ.get("TXT_PREFIX", "txt/")
+# Storage configuration (Mandatory)
+OUTPUT_BUCKET = _get_env_or_raise("OUTPUT_BUCKET")
+TXT_PREFIX = os.environ.get("TXT_PREFIX") # Optional prefix, defaults to None if unset
 
-DOCAI_LOCATION = os.environ.get("DOCAI_LOCATION", "us")
-DOCAI_PROCESSOR_ID = os.environ.get("DOCAI_PROCESSOR_ID")  # may be None for now
+# Document AI configuration (Mandatory)
+DOCAI_LOCATION = _get_env_or_raise("DOCAI_LOCATION")
+DOCAI_PROCESSOR_ID = os.environ.get("DOCAI_PROCESSOR_ID") # Checked later, as it might be None for testing
+# GCS prefix where Document AI will write its results (Mandatory for async lookup)
+DOCAI_OUTPUT_PREFIX = _get_env_or_raise("DOCAI_OUTPUT_PREFIX")
 
-# topic to notify the next stage (Gemini worker)
-NEXT_TOPIC = os.environ.get("NEXT_TOPIC", "doc-ocr-complete")
+# Pub/Sub configuration (Mandatory)
+NEXT_TOPIC = _get_env_or_raise("NEXT_TOPIC")
 
-# ---------------------------------------------------------------------
-# CLIENTS
-# ---------------------------------------------------------------------
-db = firestore.Client(project=PROJECT_ID, database=FS_DATABASE)
-storage_client = storage.Client()
+# --- CLIENT INITIALIZATION ---
+app = Flask(__name__)
+# Pass None for FS_DATABASE if unset, allowing Firestore client to use default
+db = firestore.Client(project=PROJECT_ID, database=FS_DATABASE) 
+storage_client = storage.Client(project=PROJECT_ID)
 publisher = pubsub_v1.PublisherClient()
-docai_client = documentai.DocumentProcessorServiceClient()
+
+# Initialize Document AI client with region-specific endpoint
+docai_client_options = ClientOptions(api_endpoint=f"{DOCAI_LOCATION}-documentai.googleapis.com")
+docai_client = documentai.DocumentProcessorServiceClient(client_options=docai_client_options)
 
 next_topic_path = publisher.topic_path(PROJECT_ID, NEXT_TOPIC)
 
-
 # ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# STARTUP LOG
+# STARTUP LOG 
 # ---------------------------------------------------------------------
 app.logger.info(
     f"OCR worker boot: "
@@ -53,117 +64,149 @@ app.logger.info(
     f"DOCAI_LOCATION={DOCAI_LOCATION}, "
     f"DOCAI_PROCESSOR_ID={'set' if DOCAI_PROCESSOR_ID else 'unset'}"
 )
+
+# --- HELPER FUNCTIONS ---
+
 def _now_iso() -> str:
+    """Returns current time in ISO 8601 format (your preferred format)."""
     return dt.datetime.utcnow().isoformat() + "Z"
 
-
 def _update_job(doc_id: str, payload: dict):
+    """Updates the Firestore job status document using FS_COLLECTION."""
+    # Use FS_COLLECTION or a fallback if it was not explicitly set
+    collection_name = FS_COLLECTION if FS_COLLECTION else "jobs"
     payload["updatedAt"] = _now_iso()
-    db.collection(FS_COLLECTION).document(doc_id).set(payload, merge=True)
-
-
-def _run_docai_ocr(gcs_uri: str) -> str:
-    """
-    Picks the best OCR strategy based on page count.
-    """
-    if not DOCAI_PROCESSOR_ID:
-        return f"[DocAI not configured] Source: {gcs_uri}"
-
-    # 1) Download the PDF
-    bucket_name, object_name = gcs_uri.replace("gs://", "").split("/", 1)
-    pdf_bytes = storage_client.bucket(bucket_name).blob(object_name).download_as_bytes()
-    pdf_file = io.BytesIO(pdf_bytes)
-
-    # 2) Count pages locally
-    reader = PdfReader(pdf_file)
-    num_pages = len(reader.pages)
-    app.logger.info(f"DocAI: {gcs_uri} has {num_pages} pages")
-
-    name = docai_client.processor_path(PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID)
-
-    def _process_online(doc_bytes, process_options=None):
-        """Helper to process a raw document from bytes."""
-        raw_doc = documentai.RawDocument(
-            content=doc_bytes, mime_type="application/pdf"
-        )
-        req = documentai.ProcessRequest(
-            name=name,
-            raw_document=raw_doc,
-            process_options=process_options
-        )
-        return docai_client.process_document(request=req).document
-
-    # Helper: build ProcessOptions for "imageless"
-    def _opts_native():
-        return documentai.ProcessOptions(
-            ocr_config=documentai.OcrConfig(enable_native_pdf_parsing=True)
-        )
-
-    # 3) Strategy selection
-    if num_pages <= 15:
-        # Strategy 1: Image-based, all pages at once
-        app.logger.info(f"Strategy: Online (1 chunk, {num_pages} pages)")
-        doc = _process_online(pdf_bytes)
-        return doc.text or ""
-
-    if num_pages <= 30:
-        # Strategy 2: Try native ("imageless") parsing first
-        app.logger.info(f"Strategy: Online Imageless (1 chunk, {num_pages} pages)")
-        try:
-            doc = _process_online(pdf_bytes, _opts_native())
-            text = (doc.text or "").strip()
-            if text:
-                return text
-            app.logger.info("Native parsing returned empty text; falling back to chunks.")
-        except Exception as ex:
-            # Some processors ignore imageless and still enforce 15-page limit
-            app.logger.warning(f"Native parsing failed, falling back to chunks: {ex}")
-
-    # Strategy 3: Chunking (for >30 pages OR imageless fallback)
-    # We must create new, smaller PDFs for each chunk.
-    app.logger.info(f"Strategy: Online Chunking ({num_pages} total pages)")
-    combined = []
-    start = 1
-    chunk_size = 15  # Max pages for online processing
-
-    while start <= num_pages:
-        end = min(start + chunk_size - 1, num_pages)
-        app.logger.info(f"Processing chunk: pages {start}-{end}")
-
-        # Create a new PDF in memory with just this chunk's pages
-        writer = PdfWriter()
-        for page_num in range(start - 1, end):  # pypdf is 0-indexed
-            writer.add_page(reader.pages[page_num])
-
-        # Get the bytes from the in-memory PDF
-        chunk_io = io.BytesIO()
-        writer.write(chunk_io)
-        chunk_bytes = chunk_io.getvalue()
-
-        # Process *only* the chunk bytes
-        d = _process_online(chunk_bytes)
-        combined.append(d.text or "")
-        start = end + 1
-
-    return "\n".join(combined)
-
-
-def _write_text_to_gcs(text: str, doc_id: str) -> str:
-    out_name = f"{TXT_PREFIX}{doc_id}.txt"
-    blob = storage_client.bucket(OUTPUT_BUCKET).blob(out_name)
-    blob.upload_from_string(text, content_type="text/plain; charset=utf-8")
-    return f"gs://{OUTPUT_BUCKET}/{out_name}"
-
+    db.collection(collection_name).document(doc_id).set(payload, merge=True)
 
 def _publish_next(payload: dict):
+    """Publishes a message to the next Pub/Sub topic."""
     data = json.dumps(payload).encode("utf-8")
     msg_id = publisher.publish(next_topic_path, data).result(timeout=10)
     app.logger.info(f"Published to {NEXT_TOPIC} msg_id={msg_id} for docId={payload.get('docId')}")
 
+def _write_text_to_gcs(text_content: str, doc_id: str) -> str:
+    """Writes the extracted text content to GCS using TXT_PREFIX."""
+    # Prepend prefix if set, otherwise default to just the doc_id name
+    prefix = TXT_PREFIX if TXT_PREFIX else ""
+    out_name = f"{prefix}{doc_id}.txt"
+    blob = storage_client.bucket(OUTPUT_BUCKET).blob(out_name)
+    blob.upload_from_string(text_content, content_type="text/plain; charset=utf-8")
+    gcs_uri = f"gs://{OUTPUT_BUCKET}/{out_name}"
+    app.logger.info(f"Text content written to {gcs_uri}")
+    return gcs_uri
 
-# ---------------------------------------------------------------------
+# --- DOCUMENT AI ASYNCHRONOUS BATCH LOGIC ---
+
+def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
+    """
+    Starts an asynchronous Document AI batch process.
+    The output is configured to use the doc_id as the primary GCS prefix for result lookup.
+    """
+    if not DOCAI_PROCESSOR_ID:
+        raise ValueError("DOCAI_PROCESSOR_ID environment variable is not set.")
+
+    processor_name = docai_client.processor_path(
+        PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID
+    )
+
+    # 1. Input Configuration (The single PDF file)
+    input_documents = documentai.BatchDocumentsInputConfig(
+        gcs_documents=documentai.GcsDocuments(
+            documents=[
+                documentai.GcsDocument(
+                    gcs_uri=gcs_uri, mime_type="application/pdf"
+                )
+            ]
+        )
+    )
+
+    # 2. Output Configuration (CRITICAL: Use doc_id in the prefix for easy retrieval)
+    custom_output_prefix = f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
+    output_gcs_uri = f"gs://{OUTPUT_BUCKET}/{custom_output_prefix}"
+    
+    document_output_config = documentai.DocumentOutputConfig(
+        gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
+            gcs_uri=output_gcs_uri,
+        )
+    )
+
+    # 3. Create the Batch Request
+    request = documentai.BatchProcessRequest(
+        name=processor_name,
+        input_documents=input_documents,
+        document_output_config=document_output_config,
+    )
+
+    # 4. Start the Long Running Operation (LRO)
+    operation = docai_client.batch_process_documents(request=request)
+    
+    app.logger.info(
+        f"Started Document AI Batch Operation: {operation.operation.name}. "
+        f"Results will be written to {output_gcs_uri}"
+    )
+    
+    return operation.operation.name, custom_output_prefix
+
+def _read_docai_output(doc_id: str) -> str:
+    """
+    Reads the DocAI output JSON file(s) from the dedicated output folder
+    and extracts the full text. This is called by the /docai_result endpoint.
+    """
+    # The full prefix is the DOCAI_OUTPUT_PREFIX + doc_id
+    docai_folder_prefix = f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
+
+    # 1. List blobs to find the dynamically generated LRO folder
+    blobs = storage_client.list_blobs(
+        OUTPUT_BUCKET, prefix=docai_folder_prefix, delimiter="/"
+    )
+    
+    # Get the LRO sub-folder prefix (e.g., docai-results/job_12345/projects_..._operations_abc/)
+    lro_folder_prefixes = [p for p in blobs.prefixes if p.startswith(docai_folder_prefix)]
+    
+    if not lro_folder_prefixes:
+        app.logger.error(f"DocAI result LRO folder not found for {doc_id}")
+        raise FileNotFoundError(f"LRO folder not found in {docai_folder_prefix}")
+
+    # 2. List all JSON files inside the detected LRO folder
+    lro_folder_path = lro_folder_prefixes[0] 
+    
+    result_blobs = list(storage_client.list_blobs(
+        OUTPUT_BUCKET, prefix=lro_folder_path, match_glob="**/document.json"
+    ))
+    
+    # Fallback to common shard files if document.json isn't found
+    if not result_blobs:
+        result_blobs = list(storage_client.list_blobs(
+            OUTPUT_BUCKET, prefix=lro_folder_path, match_glob="**/*.json"
+        ))
+
+    if not result_blobs:
+        app.logger.error(f"No DocAI JSON output found for {doc_id} at {lro_folder_path}")
+        raise FileNotFoundError(f"No result JSON found for {doc_id}")
+    
+    # Download and parse the first result JSON (assuming a single document in the batch)
+    result_blob = result_blobs[0]
+    json_data = result_blob.download_as_bytes()
+    
+    # Document AI output is in Protocol Buffer format (JSON-encoded)
+    document = documentai.Document.from_json(json_data, ignore_unknown_fields=True)
+    
+    # The text is the full document text, which is what you want for OCR
+    return document.text or ""
+
+# --- ENDPOINTS ---
+
+@app.get("/")
+def health():
+    """Simple health check endpoint."""
+    return "ok", 200
+
 @app.post("/work")
 def work():
+    """
+    Initial Pub/Sub trigger for a new job.
+    This now STARTs the Document AI batch job (asynchronously) and exits.
+    """
     # Pub/Sub push envelope
     envelope = request.get_json(silent=True)
     if not envelope or "message" not in envelope:
@@ -171,6 +214,7 @@ def work():
 
     msg = envelope["message"]
     data_b64 = msg.get("data", "")
+    doc_id = None
 
     try:
         decoded = base64.b64decode(data_b64).decode("utf-8")
@@ -181,62 +225,141 @@ def work():
 
     doc_id = payload.get("docId")
     gcs_uri = payload.get("gcsUri")
-    routing = payload.get("routing") or {}
+    routing_info = payload.get("routing") or {}
 
     if not doc_id or not gcs_uri:
         app.logger.error("missing docId or gcsUri")
         return ("MISSING FIELDS", 200)
 
-    # mark OCR start
-    _update_job(doc_id, {
-        "status": "RUNNING",
-        "phase": "OCR",
-        "ocr": {
-            "processorId": DOCAI_PROCESSOR_ID,
-            "location": DOCAI_LOCATION
-        }
-    })
-
     try:
-        # 1) run OCR (real or fake)
-        ocr_text = _run_docai_ocr(gcs_uri)
+        # --- LOGIC: Start the Asynchronous Batch Job ---
+        lro_name, docai_output_prefix = _start_docai_batch_job(gcs_uri, doc_id)
 
-        # 2) write to txt/
+        # Update Firestore job status to PENDING
+        _update_job(doc_id, {
+            "status": "PENDING",
+            "phase": "DOCAI_BATCH_SENT",
+            "lroName": lro_name,
+            "ocr": {
+                "processorId": DOCAI_PROCESSOR_ID,
+                "location": DOCAI_LOCATION
+            },
+            # Store routing info for the next stage to use
+            "routing": routing_info, 
+        })
+        
+        app.logger.info(f"Batch job started successfully for {doc_id}. LRO: {lro_name}")
+        return ("OK", 200) # IMPORTANT: Return immediately!
+
+    except Exception as e:
+        app.logger.error(f"Failed to start batch job for {doc_id}: {e}")
+        # Update job with failure status
+        if doc_id:
+            _update_job(doc_id, {
+                "status": "FAILED", 
+                "error": str(e), 
+                "phase": "DOCAI_BATCH_START_ERROR",
+                "routing": routing_info,
+            })
+        # Return 200 so Pub/Sub does not retry (the job will never succeed)
+        return ("FAILED", 200)
+
+
+@app.post("/docai_result")
+def docai_result():
+    """
+    Endpoint triggered by the GCS Notification Pub/Sub message when
+    Document AI writes the output file(s) to the output bucket.
+    This completes the asynchronous job.
+    """
+    doc_id = None
+    try:
+        envelope = request.get_json(silent=True)
+        if not envelope or "message" not in envelope:
+            abort(400, "Bad Pub/Sub push")
+        
+        # 1. Parse the Cloud Storage Notification
+        message = envelope.get("message", {})
+        data_encoded = message.get("data")
+        if not data_encoded:
+            raise ValueError("No data field in GCS Pub/Sub message.")
+        
+        # The data contains the Cloud Storage Event JSON
+        data = json.loads(base64.b64decode(data_encoded).decode("utf-8"))
+        
+        output_object_name = data.get("name")
+        
+        # We only care about the file that confirms LRO completion.
+        if "operation.json" not in output_object_name:
+             app.logger.info(f"Ignoring file: {output_object_name}")
+             return ("OK - Ignoring partial file", 200)
+
+        app.logger.info(f"DocAI operation.json received: {output_object_name}")
+
+        # 2. Extract the doc_id from the GCS output path.
+        # Path format: {DOCAI_OUTPUT_PREFIX}{doc_id}/LRO_FOLDER_ID/operation.json
+        lro_sub_path = output_object_name.replace(DOCAI_OUTPUT_PREFIX, "", 1)
+        doc_id = lro_sub_path.split("/")[0]
+
+        if not doc_id:
+             raise ValueError(f"Could not extract doc_id from path: {output_object_name}")
+        
+        # 3. Retrieve the job information from Firestore
+        # Use FS_COLLECTION or a fallback if it was not explicitly set
+        collection_name = FS_COLLECTION if FS_COLLECTION else "jobs"
+        job_doc = db.collection(collection_name).document(doc_id).get()
+        if not job_doc.exists:
+            app.logger.warning(f"Job document {doc_id} not found. Continuing without full job data.")
+            routing_info = {}
+            # Fallback for gcs_uri; this assumes a convention, but is okay for a fallback
+            gcs_uri = f"gs://{os.environ.get('INPUT_BUCKET', 'INPUT_BUCKET_UNKNOWN')}/source-docs/{doc_id}.pdf" 
+        else:
+            job_data = job_doc.to_dict()
+            routing_info = job_data.get("routing", {})
+            gcs_uri = job_data.get("gcsUri") # Should be available from the job start
+
+
+        # 4. Read DocAI output and extract text
+        ocr_text = _read_docai_output(doc_id)
+
+        # 5. Write raw text to the 'txt/' GCS folder
         text_uri = _write_text_to_gcs(ocr_text, doc_id)
 
-        # 3) update job
+        # 6. Update job status and artifacts
         _update_job(doc_id, {
             "status": "SUCCEEDED",
             "phase": "OCR_DONE",
-            "artifacts": {
-                "textUri": text_uri
-            }
+            "artifacts": {"textUri": text_uri},
+            "docaiOutputUri": f"gs://{OUTPUT_BUCKET}/{DOCAI_OUTPUT_PREFIX}{doc_id}/",
         })
-
-        # 4) tell next worker (Gemini) to run
+        
+        # 7. Publish to next worker (Gemini)
         _publish_next({
             "type": "ocr.done",
             "docId": doc_id,
             "textUri": text_uri,
             "gcsUri": gcs_uri,
-            "routing": routing,   # pass through schemaId / promptId
+            "routing": routing_info,  
             "ts": _now_iso()
         })
 
-        app.logger.info(f"OCR OK for {doc_id} -> {text_uri}")
+        app.logger.info(f"Batch OCR COMPLETE and published for {doc_id} -> {text_uri}")
         return ("OK", 200)
 
     except Exception as e:
-        app.logger.error(f"OCR failed for {doc_id}: {e}")
-        _update_job(doc_id, {
-            "status": "FAILED",
-            "phase": "OCR",
-            "errors": [str(e)]
-        })
-        # return 200 so Pub/Sub stops retrying forever
-        return ("FAILED", 200)
+        app.logger.error(f"DocAI result processing failed for {doc_id}: {e}")
+        # Update job with failure status
+        if doc_id:
+            try:
+                _update_job(doc_id, {
+                    "status": "FAILED", 
+                    "error": str(e), 
+                    "phase": "DOCAI_RESULT_ERROR"
+                })
+            except Exception as update_error:
+                app.logger.error(f"Failed to update job status after result error: {update_error}")
+        return (f"ERROR: {e}", 500)
 
 
-@app.get("/")
-def health():
-    return "ok", 200
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
