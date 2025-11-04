@@ -1,7 +1,7 @@
-Flask>=3.0.0
+Flask>=3.0.3
 gunicorn>=21.2.0
-google-cloud-firestore>=2.16.0
-google-cloud-storage>=2.16.0
-google-cloud-pubsub>=2.21.0
-google-cloud-documentai>=2.27.0
-pypdf>=4.2.0
+google-cloud-firestore==2.16.1
+google-cloud-storage==2.18.2
+google-cloud-pubsub==2.21.5
+google-cloud-documentai==2.27.0
+pypdf==5.0.1
