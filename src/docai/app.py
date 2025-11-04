@@ -2,10 +2,12 @@ import os
 import json
 import base64
 import datetime as dt
+import time # Import time for retries
 from flask import Flask, request, abort
 from google.cloud import firestore, storage, pubsub_v1
 from google.cloud import documentai_v1 as documentai
 from google.api_core.client_options import ClientOptions
+from google.api_core import exceptions as gcp_exceptions 
 
 # --- HELPER TO ENFORCE ENV VARS ---
 def _get_env_or_raise(name: str) -> str:
@@ -99,8 +101,7 @@ def _write_text_to_gcs(text_content: str, doc_id: str) -> str:
 
 def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
     """
-    Starts an asynchronous Document AI batch process.
-    The output is configured to use the doc_id as the primary GCS prefix for result lookup.
+    Starts an asynchronous Document AI batch process with retry logic.
     """
     if not DOCAI_PROCESSOR_ID:
         raise ValueError("DOCAI_PROCESSOR_ID environment variable is not set.")
@@ -109,21 +110,16 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
         PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID
     )
 
-    # 1. Input Configuration (The single PDF file)
-    input_documents = documentai.BatchDocumentsInputConfig(
-        gcs_documents=documentai.GcsDocuments(
-            documents=[
-                documentai.GcsDocument(
-                    gcs_uri=gcs_uri, mime_type="application/pdf"
-                )
-            ]
-        )
+    # 1. Input Configuration
+    input_config = documentai.BatchProcessRequest.BatchInputConfig(
+        gcs_source=documentai.GcsSource(
+            uri=gcs_uri
+        ),
+        mime_type="application/pdf"
     )
 
     # 2. Output Configuration (CRITICAL: Use doc_id in the prefix for easy retrieval)
-    custom_output_prefix = f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
-    output_gcs_uri = f"gs://{OUTPUT_BUCKET}/{custom_output_prefix}"
-    
+    output_gcs_uri = f"gs://{OUTPUT_BUCKET}/{DOCAI_OUTPUT_PREFIX}{doc_id}/"
     document_output_config = documentai.DocumentOutputConfig(
         gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
             gcs_uri=output_gcs_uri,
@@ -133,25 +129,47 @@ def _start_docai_batch_job(gcs_uri: str, doc_id: str) -> tuple[str, str]:
     # 3. Create the Batch Request
     request = documentai.BatchProcessRequest(
         name=processor_name,
-        input_documents=input_documents,
+        input_configs=[input_config],
         document_output_config=document_output_config,
     )
 
-    # 4. Start the Long Running Operation (LRO)
-    operation = docai_client.batch_process_documents(request=request)
-    
-    app.logger.info(
-        f"Started Document AI Batch Operation: {operation.operation.name}. "
-        f"Results will be written to {output_gcs_uri}"
-    )
-    
-    return operation.operation.name, custom_output_prefix
+    # 4. Start the Long Running Operation (LRO) with retry logic
+    max_retries = 3
+    delay = 2 # seconds
+    for attempt in range(max_retries):
+        try:
+            operation = docai_client.batch_process_documents(request=request)
+            
+            app.logger.info(
+                f"Batch Operation started (Attempt {attempt + 1}/{max_retries}): {operation.operation.name}. "
+                f"Results will be written to {output_gcs_uri}"
+            )
+            
+            # Success, break loop
+            return operation.operation.name, f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
+
+        # Catch transient errors (like quota or network issues)
+        except (gcp_exceptions.ResourceExhausted, gcp_exceptions.Aborted, gcp_exceptions.Unavailable) as e:
+            if attempt < max_retries - 1:
+                app.logger.warning(f"Transient error on DocAI start (Attempt {attempt + 1}): {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                app.logger.error(f"DocAI start failed after {max_retries} attempts.")
+                raise # Re-raise the exception if final attempt fails
+        
+        # Catch hard configuration errors (like InvalidArgument) immediately
+        except gcp_exceptions.InvalidArgument as e:
+             # Explicitly catch quota/limit errors and log them as critical
+            error_message = str(e)
+            if "page limit" in error_message.lower() or "quota" in error_message.lower():
+                app.logger.critical(f"Critical API Error: {error_message}. Check project quota.")
+            raise # Re-raise the exception for the /work handler to catch
 
 def _read_docai_output(doc_id: str) -> str:
     """
     Reads the DocAI output JSON file(s) from the dedicated output folder
-    and extracts the full text. This is called by the /docai_result endpoint.
-    This logic is required to get the text, even if the JSON files themselves are ignored.
+    and extracts the full text. This logic is required to get the text.
     """
     # The full prefix is the DOCAI_OUTPUT_PREFIX + doc_id
     docai_folder_prefix = f"{DOCAI_OUTPUT_PREFIX}{doc_id}/"
@@ -238,7 +256,7 @@ def work():
         return ("MISSING FIELDS", 200)
 
     try:
-        # --- LOGIC: Start the Asynchronous Batch Job ---
+        # --- LOGIC: Start the Asynchronous Batch Job with Retries ---
         lro_name, docai_output_prefix = _start_docai_batch_job(gcs_uri, doc_id)
 
         # Update Firestore job status to PENDING
@@ -258,12 +276,14 @@ def work():
         return ("OK", 200) # IMPORTANT: Return immediately!
 
     except Exception as e:
-        app.logger.error(f"Failed to start batch job for {doc_id}: {e}")
+        error_message = str(e)
+        app.logger.error(f"Failed to start batch job for {doc_id}: {error_message}")
+        
         # Update job with failure status
         if doc_id:
             _update_job(doc_id, {
                 "status": "FAILED", 
-                "error": str(e), 
+                "error": error_message, 
                 "phase": "DOCAI_BATCH_START_ERROR",
                 "routing": routing_info,
             })
