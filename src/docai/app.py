@@ -309,10 +309,11 @@ def docai_result():
         collection_name = FS_COLLECTION if FS_COLLECTION else "jobs"
         job_doc = db.collection(collection_name).document(doc_id).get()
         if not job_doc.exists:
-            app.logger.warning(f"Job document {doc_id} not found. Continuing without full job data.")
+            app.logger.warning(f"Job document {doc_id} not found. Continuing without full job data. Original source GCS URI cannot be determined.")
             routing_info = {}
-            # Fallback for gcs_uri; this assumes a convention, but is okay for a fallback
-            gcs_uri = f"gs://{os.environ.get('INPUT_BUCKET', 'INPUT_BUCKET_UNKNOWN')}/source-docs/{doc_id}.pdf" 
+            # The gcsUri is stored in the job document. If the document is missing,
+            # we cannot reliably construct the original file location, so we set it to None.
+            gcs_uri = None 
         else:
             job_data = job_doc.to_dict()
             routing_info = job_data.get("routing", {})
@@ -338,7 +339,7 @@ def docai_result():
             "type": "ocr.done",
             "docId": doc_id,
             "textUri": text_uri,
-            "gcsUri": gcs_uri,
+            "gcsUri": gcs_uri,  
             "routing": routing_info,  
             "ts": _now_iso()
         })
