@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/gcloud
+    args:
+      - run
+      - deploy
+      - doc-worker-ocr
+      - --region=us-central1
+      - --source=src/docai
+      - --allow-unauthenticated
+    env:
+      - CLOUDSDK_CORE_DISABLE_PROMPTS=1
